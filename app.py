@@ -1,249 +1,291 @@
 import os
-import re
 import json
+from dataclasses import asdict
+from typing import Any, Dict, Optional
+
 import streamlit as st
 from dotenv import load_dotenv
 from google import genai
 
+from core.prompts import sensor_prompt, mediator_prompt
+from core.perception import safe_parse_json, parse_constitution_rules, extract_tension_level
+from core.memory import utc_now_iso, add_run_artifacts, apply_retention_policy, export_payload
+from core.schema import LedgerEntry, VibePoint, Tier1Record, Tier2Summary, Tier3Embedding
+
+# -------------------------
+# App Config
+# -------------------------
 load_dotenv()
+st.set_page_config(page_title="HALO — Ambient Agent Demo", layout="wide")
+st.title("HALO — Ambient Agent Command Center (Demo)")
+st.caption("Constitution → Perception Events → Mediation → Ledger → Vibe Trend → Memory Decay. (Not therapy.)")
 
-st.set_page_config(page_title="RelateAI", layout="centered")
-st.title("RelateAI — Agentic Neutral Black Box (Demo)")
-st.caption("Gemini simulates perception events → Gemini mediates with evidence (Not therapy).")
+# -------------------------
+# Secrets / Client
+# -------------------------
+def get_api_key() -> Optional[str]:
+    if "GEMINI_API_KEY" in st.secrets:
+        return st.secrets["GEMINI_API_KEY"]
+    return os.getenv("GEMINI_API_KEY")
 
-api_key = os.getenv("GEMINI_API_KEY")
+api_key = get_api_key()
 if not api_key:
-    st.error("Missing GEMINI_API_KEY. Put it in a .env file.")
+    st.error("Missing GEMINI_API_KEY. Add it to Streamlit Secrets (TOML) or local .env.")
     st.stop()
 
 client = genai.Client(api_key=api_key)
 
-MODEL_NAME = "gemini-2.5-flash"
+# -------------------------
+# Session State
+# -------------------------
+def ensure_state():
+    if "model_name" not in st.session_state:
+        st.session_state.model_name = "gemini-2.5-flash"
+
+    if "ledger_48h" not in st.session_state:
+        st.session_state.ledger_48h = []  # List[LedgerEntry]
+
+    if "vibe_history" not in st.session_state:
+        st.session_state.vibe_history = []  # List[VibePoint]
+
+    if "tier1_events_48h" not in st.session_state:
+        st.session_state.tier1_events_48h = []  # List[Tier1Record]
+
+    if "tier2_summaries_30d" not in st.session_state:
+        st.session_state.tier2_summaries_30d = []  # List[Tier2Summary]
+
+    if "tier3_embeddings" not in st.session_state:
+        st.session_state.tier3_embeddings = []  # List[Tier3Embedding]
+
+    if "last_events" not in st.session_state:
+        st.session_state.last_events = None
+
+    if "last_result" not in st.session_state:
+        st.session_state.last_result = None
+
+ensure_state()
 
 # -------------------------
-# Helpers
+# Sidebar Controls
 # -------------------------
-def safe_parse_json(text: str):
-    """Try to parse JSON even if model accidentally wraps it with extra text."""
-    if not text:
-        return None
-    text = text.strip()
-    try:
-        return json.loads(text)
-    except Exception:
-        m = re.search(r"\{.*\}", text, re.S)
-        if m:
-            try:
-                return json.loads(m.group(0))
-            except Exception:
-                return None
-        return None
+with st.sidebar:
+    st.header("Run Controls")
+    st.session_state.model_name = st.text_input("Model", value=st.session_state.model_name)
+    perception_mode = st.selectbox("Perception mode", ["demo_mock", "conservative"], index=0)
 
-def build_sensor_prompt(chat: str, manual: str) -> str:
-    """
-    Gemini #1: simulate events like sensors (Recorder/Vision/Tension)
-    """
-    return f"""
-You are the "Perception Layer" of a home-neutral AI system.
-Given household manual + chat, simulate the events that a real system would produce.
-Important: This is a DEMO simulation. Do NOT invent sensitive personal data.
-Be neutral and non-therapeutic.
+    st.markdown("---")
+    st.subheader("Privacy Controls (Demo)")
+    show_raw_chat = st.checkbox("Show raw chat on screen (demo only)", value=True)
+    store_raw_chat = st.checkbox(
+        "Store raw chat (NOT recommended)",
+        value=False,
+        help="Keep OFF. Proposal says no raw audio/video; raw chat also should not be stored.",
+    )
 
-Household Manual:
-\"\"\"{manual}\"\"\"
-
-Chat history:
-\"\"\"{chat}\"\"\"
-
-Return STRICT JSON only with this schema:
-{{
-  "events": [
-    {{
-      "type": "SpeechEvent",
-      "timestamp_hint": "e.g., Tue 7pm or unknown",
-      "speaker": "A|B|unknown",
-      "quote": "direct quote from the chat",
-      "thought_signature": {{
-        "intent": "request|complaint|defense|clarify|boundary|repair_attempt|other",
-        "topic_tags": ["trash","chores","tone","time","fairness"],
-        "implicit_need": "short neutral phrase"
-      }}
-    }},
-    {{
-      "type": "VisionTaskEvent",
-      "timestamp_hint": "optional",
-      "task": "kitchen_trash|bathroom_trash|dishes|laundry|other",
-      "state": "done|not_done|unknown",
-      "confidence": 0.0
-    }},
-    {{
-      "type": "TensionSignalEvent",
-      "timestamp_hint": "optional",
-      "level": "low|rising|high",
-      "signals": ["absolute_language","blame","sarcasm","rapid_escalation","exclamation","questioning"],
-      "explanation": "1 sentence, neutral"
-    }}
-  ],
-  "notes": {{
-    "what_is_simulated": "1 sentence explaining these events are simulated for demo",
-    "privacy_statement": "1 sentence about storing only derived states, not raw video"
-  }}
-}}
-
-Rules:
-- Include 3-8 SpeechEvent items from the chat (quotes must appear in chat).
-- Include 1-3 VisionTaskEvent items that are plausible given the chat + manual (state can be 'unknown').
-- Include exactly 1 TensionSignalEvent summarizing escalation risk.
-- STRICT JSON only. No markdown. No extra text.
-"""
-
-def build_mediator_prompt(events_json: dict, manual: str) -> str:
-    """
-    Gemini #2: mediator reasoning using events + manual → Fact Receipt + notice decision
-    """
-    events_text = json.dumps(events_json, ensure_ascii=False)
-    return f"""
-You are the "Mediator / Reasoning Engine" of a neutral home AI.
-Use the events (simulated perception) + Household Manual to produce a Fact Receipt.
-Focus on evidence and rule alignment. Non-therapeutic. No diagnosis.
-
-Household Manual:
-\"\"\"{manual}\"\"\"
-
-Simulated Events JSON:
-\"\"\"{events_text}\"\"\"
-
-Return STRICT JSON only with this schema:
-{{
-  "fact_receipt": {{
-    "evidence_from_chat": [
-      {{
-        "quote": "direct quote (from SpeechEvent.quote)",
-        "speaker": "A|B|unknown",
-        "why_it_matters": "short neutral explanation"
-      }}
-    ],
-    "evidence_from_manual": [
-      {{
-        "rule": "direct excerpt from manual",
-        "why_it_matters": "short"
-      }}
-    ]
-  }},
-  "conclusion": {{
-    "type": "memory_mismatch|rule_mismatch|ambiguous",
-    "one_sentence_summary": "neutral"
-  }},
-  "suggestions": {{
-    "for_A": ["2-3 concrete actions, respectful"],
-    "for_B": ["2-3 concrete actions, respectful"],
-    "rule_update_proposal": "one proposed updated rule in plain language"
-  }},
-  "quiet_warning": {{
-    "should_notify": true,
-    "notify_target": "A|B|both",
-    "message": "private nudge message, 1-2 sentences, actionable"
-  }}
-}}
-
-Rules:
-- Evidence quotes MUST come from SpeechEvent.quote.
-- Manual rules MUST be excerpts from the given manual text.
-- Conclusion must pick ONE of the 3 types and justify neutrally.
-- Suggestions must be concrete and practical.
-- STRICT JSON only. No markdown. No extra text.
-"""
+    st.markdown("---")
+    if st.button("🧹 Clear session (demo reset)"):
+        for k in list(st.session_state.keys()):
+            if k not in ("model_name",):
+                del st.session_state[k]
+        ensure_state()
+        st.success("Session cleared.")
 
 # -------------------------
-# UI inputs
+# Main Layout
 # -------------------------
-default_manual = """Household Manual (Draft)
+col_left, col_right = st.columns([1.05, 1])
+
+with col_left:
+    st.subheader("1) Household Constitution (shared rules)")
+    default_constitution = """# Household Constitution (Draft)
 - "Trash Day" means checking ALL bins: kitchen, bathroom, bedroom, office.
 - If someone says "take out the trash", it includes the bathroom bin unless specified otherwise.
-- When requesting help, prefer clear task specs: which room(s), by what time.
+- No serious talks while physiologically stressed (pause 5 minutes, then resume).
+- When requesting help, use clear task specs: which room(s), by what time.
+- Assume good intent; ask one clarifying question before blaming.
 """
+    constitution = st.text_area("Constitution", value=default_constitution, height=220)
 
-manual = st.text_area("Household Manual (shared rules)", value=default_manual, height=160)
+    st.subheader("2) Scenario Input (chat)")
+    chat_text = st.text_area(
+        "Paste chat (A: ... / B: ...)",
+        height=220,
+        placeholder="A: You never told me to check the bathroom trash!\nB: I thought you meant only the kitchen.\nA: We talked about trash day rules already..."
+    )
 
-chat_text = st.text_area(
-    "Paste chat history (format like A: ... / B: ...)",
-    height=260,
-    placeholder="A: You never told me to check the bathroom trash!\nB: I thought you meant only the kitchen.\nA: We talked about trash day rules already..."
-)
+    st.subheader("3) Optional Context (for richer mock sensing)")
+    context_notes = st.text_area(
+        "Context (optional)",
+        height=90,
+        placeholder='e.g., "Evening, kitchen. One partner cleaning, other on couch. Apple Watch available."'
+    )
+
+    run = st.button("▶ Run HALO Loop (Perception → Mediation)", type="primary", disabled=(len(chat_text.strip()) == 0))
+
+with col_right:
+    st.subheader("Command Center")
+    rules_list = parse_constitution_rules(constitution)
+    st.write("Parsed rules (quick view):")
+    st.json({"rules": rules_list})
+
+    st.markdown("---")
+    tabs = st.tabs(["Perception Events", "Fact Ledger (48h)", "Vibe Score (30d)", "Memory & Decay", "Export"])
 
 # -------------------------
-# Run Agentic demo (2-stage)
+# Run Loop
 # -------------------------
-if st.button("Analyze (Agentic)", type="primary", disabled=(len(chat_text.strip()) == 0)):
-    # ---- Stage 1: Simulate events ----
-    with st.spinner("Stage 1/2: Gemini simulating perception events..."):
-        sensor_prompt = build_sensor_prompt(chat_text, manual)
-        resp1 = client.models.generate_content(model=MODEL_NAME, contents=sensor_prompt)
-        raw1 = resp1.text or ""
-        events = safe_parse_json(raw1)
+if run:
+    if store_raw_chat:
+        st.warning("Raw chat storage is ON (demo). Proposal recommends storing only derived events, not raw chat/audio/video.")
+
+    # Stage 1: Perception
+    with st.spinner("Stage 1/2: Generating perception events (simulated sensors)…"):
+        p1 = sensor_prompt(chat=chat_text, constitution=constitution, context_notes=context_notes, mode=perception_mode)
+        r1 = client.models.generate_content(model=st.session_state.model_name, contents=p1)
+        events = safe_parse_json(r1.text or "")
 
     if not events or "events" not in events:
-        st.error("Stage 1 failed: Gemini did not return valid events JSON.")
-        st.code(raw1)
+        with tabs[0]:
+            st.error("Perception failed: model did not return valid JSON.")
+            st.code(r1.text or "")
         st.stop()
 
-    st.subheader("🛰️ Simulated Events (Perception Layer)")
-    st.json(events)
+    st.session_state.last_events = events
 
-    # ---- Stage 2: Mediate with evidence ----
-    with st.spinner("Stage 2/2: Gemini mediating with evidence..."):
-        mediator_prompt = build_mediator_prompt(events, manual)
-        resp2 = client.models.generate_content(model=MODEL_NAME, contents=mediator_prompt)
-        raw2 = resp2.text or ""
-        result = safe_parse_json(raw2)
+    # Stage 2: Mediation
+    with st.spinner("Stage 2/2: Mediating with constitution + evidence…"):
+        p2 = mediator_prompt(events_json=events, constitution=constitution)
+        r2 = client.models.generate_content(model=st.session_state.model_name, contents=p2)
+        result = safe_parse_json(r2.text or "")
 
     if not result:
-        st.error("Stage 2 failed: Gemini did not return valid mediation JSON.")
-        st.code(raw2)
+        with tabs[0]:
+            st.error("Mediation failed: model did not return valid JSON.")
+            st.code(r2.text or "")
         st.stop()
 
-    # -------------------------
-    # Render results nicely
-    # -------------------------
-    st.subheader("🧾 Fact Receipt")
-    fr = result.get("fact_receipt", {})
-    chat_ev = fr.get("evidence_from_chat", [])
-    man_ev = fr.get("evidence_from_manual", [])
+    st.session_state.last_result = result
 
-    st.write("**Evidence from chat**")
-    if chat_ev:
-        for e in chat_ev:
-            st.write(f"- ({e.get('speaker','?')}) “{e.get('quote','')}” — {e.get('why_it_matters','')}")
+    # Store derived artifacts
+    ts = utc_now_iso()
+    tension_level, _hint = extract_tension_level(events)
+
+    add_run_artifacts(
+        ts=ts,
+        events=events,
+        result=result,
+        ledger_48h=st.session_state.ledger_48h,
+        vibe_history=st.session_state.vibe_history,
+        tier1_events_48h=st.session_state.tier1_events_48h,
+        tier2_summaries_30d=st.session_state.tier2_summaries_30d,
+        tier3_embeddings=st.session_state.tier3_embeddings,
+        tension_level=tension_level,
+    )
+
+    apply_retention_policy(
+        ledger_48h=st.session_state.ledger_48h,
+        vibe_history=st.session_state.vibe_history,
+        tier1_events_48h=st.session_state.tier1_events_48h,
+        tier2_summaries_30d=st.session_state.tier2_summaries_30d,
+        tier3_embeddings=st.session_state.tier3_embeddings,
+    )
+
+# -------------------------
+# Render Tabs (always show last known)
+# -------------------------
+with tabs[0]:
+    st.subheader("Perception Events (Simulated)")
+    st.caption("Structured events derived from chat + constitution. Sensor signals may be simulated for demo.")
+    if st.session_state.last_events:
+        st.json(st.session_state.last_events)
     else:
-        st.write("- (none)")
+        st.info("Run the loop to generate perception events.")
 
-    st.write("**Evidence from household manual**")
-    if man_ev:
-        for e in man_ev:
-            st.write(f"- “{e.get('rule','')}” — {e.get('why_it_matters','')}")
+with tabs[1]:
+    st.subheader("Fact Ledger (48h Truth Buffer)")
+    st.caption("Stores derived facts only (quotes + constitution excerpts). No raw audio/video stored.")
+    if st.session_state.ledger_48h:
+        latest: LedgerEntry = st.session_state.ledger_48h[0]
+        st.markdown(f"### Latest Entry — {latest.ts_utc}")
+        st.json(asdict(latest))
+
+        with st.expander("Show recent entries (up to 10)"):
+            for i, e in enumerate(st.session_state.ledger_48h[:10], start=1):
+                st.markdown(f"**{i}. {e.ts_utc}**")
+                st.write(f"- conclusion: `{e.conclusion.get('type','')}`")
+                plan = e.intervention_plan or {}
+                st.write(f"- notify: **{plan.get('should_notify', False)}** via `{plan.get('channel','none')}`")
     else:
-        st.write("- (none)")
+        st.info("No ledger entries yet. Run the loop.")
 
-    st.subheader("✅ Conclusion")
-    con = result.get("conclusion", {})
-    st.write(f"**Type:** `{con.get('type','')}`")
-    st.write(con.get("one_sentence_summary", ""))
+with tabs[2]:
+    st.subheader("Vibe Score (30-day trend, demo)")
+    if st.session_state.vibe_history:
+        latest: VibePoint = st.session_state.vibe_history[-1]
+        st.metric("Latest tension level", latest.level)
+        st.metric("Last run: should notify", "Yes" if latest.notify else "No")
 
-    st.subheader("💡 Suggestions")
-    sug = result.get("suggestions", {})
-    st.write("**For Partner A**")
-    for s in sug.get("for_A", []):
-        st.write(f"- {s}")
-    st.write("**For Partner B**")
-    for s in sug.get("for_B", []):
-        st.write(f"- {s}")
+        map_level = {"low": 1, "rising": 2, "high": 3, "unknown": 0}
+        series = [map_level.get(v.level, 0) for v in st.session_state.vibe_history[-60:]]
+        st.line_chart(series)
+        st.caption("Chart: 0=unknown, 1=low, 2=rising, 3=high (demo).")
+    else:
+        st.info("No vibe history yet. Run the loop.")
 
-    st.write("**Rule update proposal**")
-    if sug.get("rule_update_proposal"):
-        st.info(sug.get("rule_update_proposal"))
+with tabs[3]:
+    st.subheader("Memory & Decay Pipeline (Demo)")
+    st.write("Tier 1: structured event metadata (48h) → Tier 2: summaries (30d) → Tier 3: embeddings (long-term)")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Tier 1 (48h)", len(st.session_state.tier1_events_48h))
+    c2.metric("Tier 2 (30d)", len(st.session_state.tier2_summaries_30d))
+    c3.metric("Tier 3 (embeddings)", len(st.session_state.tier3_embeddings))
 
-    st.subheader("⚠️ Quiet Warning")
-    qw = result.get("quiet_warning", {})
-    st.write(f"Should notify: **{qw.get('should_notify', False)}**")
-    st.write(f"Target: **{qw.get('notify_target', 'unknown')}**")
-    st.write(qw.get("message", ""))
+    colA, colB = st.columns([1, 1])
+    with colA:
+        if st.button("Apply Decay Now (clear Tier 1)"):
+            st.session_state.tier1_events_48h = []
+            st.success("Tier 1 cleared (demo).")
+    with colB:
+        if st.button("Prune to policy (48h / 30d)"):
+            apply_retention_policy(
+                ledger_48h=st.session_state.ledger_48h,
+                vibe_history=st.session_state.vibe_history,
+                tier1_events_48h=st.session_state.tier1_events_48h,
+                tier2_summaries_30d=st.session_state.tier2_summaries_30d,
+                tier3_embeddings=st.session_state.tier3_embeddings,
+            )
+            st.success("Retention policy applied.")
+
+    st.markdown("### Tier 1 (sample)")
+    st.json([asdict(x) for x in st.session_state.tier1_events_48h[:2]])
+
+    st.markdown("### Tier 2 (sample)")
+    st.json([asdict(x) for x in st.session_state.tier2_summaries_30d[:5]])
+
+    st.markdown("### Tier 3 (sample)")
+    st.json([asdict(x) for x in st.session_state.tier3_embeddings[:8]])
+
+with tabs[4]:
+    st.subheader("Export")
+    st.caption("Export derived artifacts only (no raw chat/audio/video).")
+
+    payload = export_payload(
+        ledger_48h=st.session_state.ledger_48h,
+        vibe_history=st.session_state.vibe_history,
+        tier2_summaries_30d=st.session_state.tier2_summaries_30d,
+        tier3_embeddings=st.session_state.tier3_embeddings,
+    )
+
+    st.download_button(
+        "Download HALO demo export (JSON)",
+        data=json.dumps(payload, ensure_ascii=False, indent=2),
+        file_name="halo_demo_export.json",
+        mime="application/json"
+    )
+
+    if st.session_state.last_result:
+        st.markdown("### Latest intervention plan (quick copy)")
+        plan = st.session_state.last_result.get("intervention_plan", {})
+        st.code(json.dumps(plan, ensure_ascii=False, indent=2))
+    else:
+        st.info("Run the loop to generate an export.")
