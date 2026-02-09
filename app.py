@@ -1,9 +1,12 @@
 import os
+import json
+import re
 import inspect
 import streamlit as st
-import json
 
-from core import perception, mediation, memory, schema
+from google import genai
+
+from core import mediation, memory, schema
 
 
 # -------------------------
@@ -11,14 +14,13 @@ from core import perception, mediation, memory, schema
 # -------------------------
 st.set_page_config(page_title="HALO (Demo)", layout="wide")
 st.title("HALO — Ambient Agent Command Center (Demo)")
-st.caption("Constitution → Perception → Mediation → Ledger → Vibe → Decay. (Not therapy.)")
+st.caption("Constitution → Perception Events → Mediation → Ledger → Vibe Trend → Memory Decay. (Not therapy.)")
 
 
 # -------------------------
 # Secrets / API key
 # -------------------------
 def get_api_key():
-    # Streamlit Cloud Secrets (TOML): GEMINI_API_KEY="xxxx"
     if "GEMINI_API_KEY" in st.secrets:
         return st.secrets["GEMINI_API_KEY"]
     return os.getenv("GEMINI_API_KEY")
@@ -29,10 +31,28 @@ if not api_key:
     st.error('Missing GEMINI_API_KEY. Streamlit Secrets must be TOML like:  GEMINI_API_KEY="YOUR_KEY"')
     st.stop()
 
+client = genai.Client(api_key=api_key)
+
 
 # -------------------------
-# Small helper: pick function by name
+# Helpers
 # -------------------------
+def safe_parse_json(text: str):
+    if not text:
+        return None
+    text = text.strip()
+    try:
+        return json.loads(text)
+    except Exception:
+        m = re.search(r"\{.*\}", text, re.S)
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except Exception:
+                return None
+        return None
+
+
 def pick_callable(mod, candidates):
     for name in candidates:
         fn = getattr(mod, name, None)
@@ -41,21 +61,7 @@ def pick_callable(mod, candidates):
     return None, None
 
 
-def list_callables(mod):
-    out = []
-    for name in dir(mod):
-        if name.startswith("_"):
-            continue
-        obj = getattr(mod, name)
-        if callable(obj):
-            out.append(name)
-    return sorted(out)
-
-
 def call_best(fn, **kwargs):
-    """
-    Call fn with only the kwargs it accepts (so we can pass api_key/model/etc safely).
-    """
     sig = inspect.signature(fn)
     accepted = {}
     for k, v in kwargs.items():
@@ -65,7 +71,73 @@ def call_best(fn, **kwargs):
 
 
 # -------------------------
-# Defaults
+# Prompts (Perception in app.py, since core/perception.py has no entrypoint)
+# -------------------------
+def build_perception_prompt(chat: str, constitution_text: str, context_text: str) -> str:
+    return f"""
+You are the "Perception Layer" of a neutral home AI system (DEMO).
+Given constitution + chat + optional context, produce structured "Perception Events".
+
+Constraints:
+- This is a simulation demo. Do NOT invent sensitive personal data.
+- Be neutral and non-therapeutic.
+- Quotes MUST be copied verbatim from the chat.
+
+Inputs:
+CONSTITUTION:
+\"\"\"{constitution_text}\"\"\"
+
+CONTEXT (optional):
+\"\"\"{context_text}\"\"\"
+
+CHAT:
+\"\"\"{chat}\"\"\"
+
+Return STRICT JSON only, schema:
+{{
+  "events": [
+    {{
+      "type": "SpeechEvent",
+      "timestamp_hint": "unknown|relative",
+      "speaker": "A|B|unknown",
+      "quote": "verbatim from chat",
+      "intent": "request|complaint|defense|clarify|boundary|repair_attempt|other",
+      "topic_tags": ["..."],
+      "implicit_need": "short"
+    }},
+    {{
+      "type": "TensionSignalEvent",
+      "timestamp_hint": "unknown|relative",
+      "level": "low|rising|high",
+      "signals": ["..."],
+      "explanation": "1 sentence neutral"
+    }}
+  ],
+  "notes": {{
+    "what_is_simulated": "1 sentence",
+    "privacy_statement": "1 sentence"
+  }}
+}}
+
+Rules:
+- Include 3–8 SpeechEvent items (quotes must appear in chat).
+- Include exactly 1 TensionSignalEvent.
+- STRICT JSON only. No markdown. No extra text.
+"""
+
+
+def gemini_perception(model: str, chat: str, constitution_text: str, context_text: str):
+    prompt = build_perception_prompt(chat, constitution_text, context_text)
+    resp = client.models.generate_content(model=model, contents=prompt)
+    raw = resp.text or ""
+    data = safe_parse_json(raw)
+    if not data or "events" not in data:
+        raise ValueError("Perception did not return valid JSON.")
+    return data
+
+
+# -------------------------
+# Defaults / session state
 # -------------------------
 DEFAULT_CONSTITUTION = """# Household Constitution (Draft)
 - "Trash Day" means checking ALL bins: kitchen, bathroom, bedroom, office.
@@ -80,25 +152,18 @@ B: I thought you meant only the kitchen.
 A: We talked about trash day rules already...
 """
 
-if "events" not in st.session_state:
-    st.session_state["events"] = None
-if "med" not in st.session_state:
-    st.session_state["med"] = None
-if "ledger" not in st.session_state:
-    st.session_state["ledger"] = None
-if "vibe" not in st.session_state:
-    st.session_state["vibe"] = None
-if "decay" not in st.session_state:
-    st.session_state["decay"] = None
+for k in ["events", "med", "ledger", "vibe", "decay"]:
+    if k not in st.session_state:
+        st.session_state[k] = None
 
 
 # -------------------------
-# Layout
+# UI
 # -------------------------
 left, right = st.columns([1.05, 1.0], gap="large")
 
 with left:
-    st.subheader("1) Household Constitution")
+    st.subheader("1) Household Constitution (shared rules)")
     constitution_text = st.text_area("constitution", value=DEFAULT_CONSTITUTION, height=220, label_visibility="collapsed")
 
     st.subheader("2) Scenario Input (chat)")
@@ -107,73 +172,97 @@ with left:
     st.subheader("3) Optional context")
     context_text = st.text_area("context", value="", height=90, label_visibility="collapsed")
 
-    model_name = st.text_input("Model name (optional)", value="gemini-2.5-flash")
+    model_name = st.text_input("Model", value="gemini-2.5-flash")
 
     run_disabled = (not constitution_text.strip()) or (not chat_text.strip())
     if st.button("▶ Run HALO Loop", type="primary", use_container_width=True, disabled=run_disabled):
-        with st.spinner("Running…"):
-            # A) Parse constitution (best-effort, optional)
+        with st.spinner("Running Perception → Mediation …"):
+            # A) Parse constitution (best effort)
             constitution_obj = {"raw": constitution_text}
             try:
-                # if your schema.py exposes a parser, use it; else keep raw
-                parse_fn, _ = pick_callable(schema, ["parse_constitution", "parse_rules", "from_text"])
+                parse_fn, _ = pick_callable(schema, ["parse_constitution_rules", "parse_rules", "from_text"])
                 if parse_fn:
                     constitution_obj = call_best(parse_fn, text=constitution_text, constitution_text=constitution_text)
             except Exception:
                 constitution_obj = {"raw": constitution_text}
 
-            # B) Perception
-            p_fn, p_name = pick_callable(perception, ["run_perception", "generate_events", "perception", "main"])
-            if not p_fn:
-                st.error(
-                    "Cannot find a perception entrypoint in core/perception.py.\n\n"
-                    "Expected one of: run_perception / generate_events / perception / main\n\n"
-                    f"Found callables: {list_callables(perception)}"
-                )
-                st.stop()
-
-            events = call_best(
-                p_fn,
-                api_key=api_key,
+            # B) Perception (implemented here)
+            events = gemini_perception(
                 model=model_name,
-                constitution=constitution_obj,
-                constitution_text=constitution_text,
                 chat=chat_text,
-                chat_text=chat_text,
-                context=context_text,
+                constitution_text=constitution_text,
                 context_text=context_text,
             )
             st.session_state["events"] = events
 
-            # C) Mediation
+            # C) Mediation (use your core/mediation.py if it has an entrypoint)
             m_fn, m_name = pick_callable(mediation, ["run_mediation", "mediate", "mediation", "main"])
             if not m_fn:
-                st.error(
-                    "Cannot find a mediation entrypoint in core/mediation.py.\n\n"
-                    "Expected one of: run_mediation / mediate / mediation / main\n\n"
-                    f"Found callables: {list_callables(mediation)}"
-                )
-                st.stop()
+                # If no entrypoint, fall back to a minimal mediator prompt inside app.py
+                # (Still "only app.py change" and keeps app working)
+                def fallback_mediation(events_json, constitution_text, chat_text):
+                    prompt = f"""
+You are a neutral mediator (DEMO, not therapy).
+Use events + constitution + chat to produce a Fact Receipt. Be evidence-driven and neutral.
 
-            med = call_best(
-                m_fn,
-                api_key=api_key,
-                model=model_name,
-                constitution=constitution_obj,
-                constitution_text=constitution_text,
-                events=events,
-                chat=chat_text,
-                chat_text=chat_text,
-                context=context_text,
-                context_text=context_text,
-            )
+CONSTITUTION:
+\"\"\"{constitution_text}\"\"\"
+
+EVENTS JSON:
+\"\"\"{json.dumps(events_json, ensure_ascii=False)}\"\"\"
+
+CHAT:
+\"\"\"{chat_text}\"\"\"
+
+Return STRICT JSON only:
+{{
+  "fact_receipt": {{
+    "evidence_from_chat": [{{"quote":"...","speaker":"A|B|unknown","why_it_matters":"..."}}],
+    "evidence_from_constitution": [{{"rule":"...","why_it_matters":"..."}}]
+  }},
+  "conclusion": {{"type":"memory_mismatch|rule_mismatch|ambiguous","one_sentence_summary":"..."}},
+  "suggestions": {{
+    "for_A": ["..."],
+    "for_B": ["..."],
+    "rule_update_proposal": "..."
+  }},
+  "quiet_warning": {{
+    "should_notify": true,
+    "notify_target": "A|B|both",
+    "message": "..."
+  }}
+}}
+Rules:
+- Evidence quotes MUST be verbatim from chat (or from SpeechEvent.quote).
+- Constitution rules MUST be excerpts from constitution text.
+- STRICT JSON only.
+"""
+                    resp = client.models.generate_content(model=model_name, contents=prompt)
+                    raw = resp.text or ""
+                    out = safe_parse_json(raw)
+                    if not out:
+                        raise ValueError("Fallback mediation returned invalid JSON.")
+                    return out, "fallback_mediation"
+
+                med, m_name = fallback_mediation(events, constitution_text, chat_text)
+            else:
+                med = call_best(
+                    m_fn,
+                    api_key=api_key,
+                    model=model_name,
+                    constitution=constitution_obj,
+                    constitution_text=constitution_text,
+                    events=events,
+                    chat=chat_text,
+                    chat_text=chat_text,
+                    context=context_text,
+                    context_text=context_text,
+                )
+
             st.session_state["med"] = med
 
-            # D) Memory (optional; fallback if your memory.py doesn't implement)
-            ledger = None
-            vibe = None
-            decay = None
-
+            # D) Memory (optional)
+            ledger = vibe = decay = None
             try:
                 upsert_fn, _ = pick_callable(memory, ["upsert_receipt", "store_receipt"])
                 if upsert_fn:
@@ -195,17 +284,16 @@ with left:
             except Exception:
                 decay = None
 
-            # Fallbacks so tabs don't look empty
-            st.session_state["ledger"] = ledger if ledger is not None else {"note": "ledger not implemented in memory.py (demo fallback)", "latest": med}
-            st.session_state["vibe"] = vibe if vibe is not None else {"note": "vibe not implemented (demo fallback)", "window_days": 30}
+            st.session_state["ledger"] = ledger if ledger is not None else {"note": "ledger not implemented (fallback)", "latest": med}
+            st.session_state["vibe"] = vibe if vibe is not None else {"note": "vibe not implemented (fallback)", "window_days": 30}
             st.session_state["decay"] = decay if decay is not None else {
-                "note": "decay not implemented (demo fallback)",
+                "note": "decay not implemented (fallback)",
                 "tier_1_raw_metadata_48h": True,
                 "tier_2_summaries_30d": True,
                 "tier_3_embeddings_long_term": True,
             }
 
-        st.success(f"Done. Used perception.{p_name} → mediation.{m_name}")
+        st.success("Done.")
         st.rerun()
 
 
@@ -217,14 +305,14 @@ with right:
     with tab1:
         st.subheader("Perception Events (Simulated)")
         if st.session_state["events"] is None:
-            st.info("Run the loop to generate events.")
+            st.info("Run HALO loop to generate perception events.")
         else:
             st.json(st.session_state["events"])
 
     with tab2:
-        st.subheader("Fact Ledger (48h)")
+        st.subheader("Fact Receipt / Ledger (48h)")
         if st.session_state["med"] is None:
-            st.info("Run the loop to generate mediation receipt.")
+            st.info("Run HALO loop to generate mediation receipt.")
         else:
             st.json(st.session_state["med"])
         st.divider()
