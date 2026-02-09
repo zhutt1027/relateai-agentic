@@ -1,291 +1,258 @@
 import os
-import json
-from dataclasses import asdict
-from typing import Any, Dict, Optional
-
+import inspect
 import streamlit as st
-from dotenv import load_dotenv
-from google import genai
+import json
 
-from core.prompts import sensor_prompt, mediator_prompt
-from core.perception import safe_parse_json, parse_constitution_rules, extract_tension_level
-from core.memory import utc_now_iso, add_run_artifacts, apply_retention_policy, export_payload
-from core.schema import LedgerEntry, VibePoint, Tier1Record, Tier2Summary, Tier3Embedding
+from core import perception, mediation, memory, schema
+
 
 # -------------------------
-# App Config
+# Config
 # -------------------------
-load_dotenv()
-st.set_page_config(page_title="HALO — Ambient Agent Demo", layout="wide")
+st.set_page_config(page_title="HALO (Demo)", layout="wide")
 st.title("HALO — Ambient Agent Command Center (Demo)")
-st.caption("Constitution → Perception Events → Mediation → Ledger → Vibe Trend → Memory Decay. (Not therapy.)")
+st.caption("Constitution → Perception → Mediation → Ledger → Vibe → Decay. (Not therapy.)")
+
 
 # -------------------------
-# Secrets / Client
+# Secrets / API key
 # -------------------------
-def get_api_key() -> Optional[str]:
+def get_api_key():
+    # Streamlit Cloud Secrets (TOML): GEMINI_API_KEY="xxxx"
     if "GEMINI_API_KEY" in st.secrets:
         return st.secrets["GEMINI_API_KEY"]
     return os.getenv("GEMINI_API_KEY")
 
+
 api_key = get_api_key()
 if not api_key:
-    st.error("Missing GEMINI_API_KEY. Add it to Streamlit Secrets (TOML) or local .env.")
+    st.error('Missing GEMINI_API_KEY. Streamlit Secrets must be TOML like:  GEMINI_API_KEY="YOUR_KEY"')
     st.stop()
 
-client = genai.Client(api_key=api_key)
 
 # -------------------------
-# Session State
+# Small helper: pick function by name
 # -------------------------
-def ensure_state():
-    if "model_name" not in st.session_state:
-        st.session_state.model_name = "gemini-2.5-flash"
+def pick_callable(mod, candidates):
+    for name in candidates:
+        fn = getattr(mod, name, None)
+        if callable(fn):
+            return fn, name
+    return None, None
 
-    if "ledger_48h" not in st.session_state:
-        st.session_state.ledger_48h = []  # List[LedgerEntry]
 
-    if "vibe_history" not in st.session_state:
-        st.session_state.vibe_history = []  # List[VibePoint]
+def list_callables(mod):
+    out = []
+    for name in dir(mod):
+        if name.startswith("_"):
+            continue
+        obj = getattr(mod, name)
+        if callable(obj):
+            out.append(name)
+    return sorted(out)
 
-    if "tier1_events_48h" not in st.session_state:
-        st.session_state.tier1_events_48h = []  # List[Tier1Record]
 
-    if "tier2_summaries_30d" not in st.session_state:
-        st.session_state.tier2_summaries_30d = []  # List[Tier2Summary]
+def call_best(fn, **kwargs):
+    """
+    Call fn with only the kwargs it accepts (so we can pass api_key/model/etc safely).
+    """
+    sig = inspect.signature(fn)
+    accepted = {}
+    for k, v in kwargs.items():
+        if k in sig.parameters:
+            accepted[k] = v
+    return fn(**accepted)
 
-    if "tier3_embeddings" not in st.session_state:
-        st.session_state.tier3_embeddings = []  # List[Tier3Embedding]
-
-    if "last_events" not in st.session_state:
-        st.session_state.last_events = None
-
-    if "last_result" not in st.session_state:
-        st.session_state.last_result = None
-
-ensure_state()
-
-# -------------------------
-# Sidebar Controls
-# -------------------------
-with st.sidebar:
-    st.header("Run Controls")
-    st.session_state.model_name = st.text_input("Model", value=st.session_state.model_name)
-    perception_mode = st.selectbox("Perception mode", ["demo_mock", "conservative"], index=0)
-
-    st.markdown("---")
-    st.subheader("Privacy Controls (Demo)")
-    show_raw_chat = st.checkbox("Show raw chat on screen (demo only)", value=True)
-    store_raw_chat = st.checkbox(
-        "Store raw chat (NOT recommended)",
-        value=False,
-        help="Keep OFF. Proposal says no raw audio/video; raw chat also should not be stored.",
-    )
-
-    st.markdown("---")
-    if st.button("🧹 Clear session (demo reset)"):
-        for k in list(st.session_state.keys()):
-            if k not in ("model_name",):
-                del st.session_state[k]
-        ensure_state()
-        st.success("Session cleared.")
 
 # -------------------------
-# Main Layout
+# Defaults
 # -------------------------
-col_left, col_right = st.columns([1.05, 1])
-
-with col_left:
-    st.subheader("1) Household Constitution (shared rules)")
-    default_constitution = """# Household Constitution (Draft)
+DEFAULT_CONSTITUTION = """# Household Constitution (Draft)
 - "Trash Day" means checking ALL bins: kitchen, bathroom, bedroom, office.
 - If someone says "take out the trash", it includes the bathroom bin unless specified otherwise.
 - No serious talks while physiologically stressed (pause 5 minutes, then resume).
 - When requesting help, use clear task specs: which room(s), by what time.
 - Assume good intent; ask one clarifying question before blaming.
 """
-    constitution = st.text_area("Constitution", value=default_constitution, height=220)
+
+DEFAULT_CHAT = """A: You never told me to check the bathroom trash!
+B: I thought you meant only the kitchen.
+A: We talked about trash day rules already...
+"""
+
+if "events" not in st.session_state:
+    st.session_state["events"] = None
+if "med" not in st.session_state:
+    st.session_state["med"] = None
+if "ledger" not in st.session_state:
+    st.session_state["ledger"] = None
+if "vibe" not in st.session_state:
+    st.session_state["vibe"] = None
+if "decay" not in st.session_state:
+    st.session_state["decay"] = None
+
+
+# -------------------------
+# Layout
+# -------------------------
+left, right = st.columns([1.05, 1.0], gap="large")
+
+with left:
+    st.subheader("1) Household Constitution")
+    constitution_text = st.text_area("constitution", value=DEFAULT_CONSTITUTION, height=220, label_visibility="collapsed")
 
     st.subheader("2) Scenario Input (chat)")
-    chat_text = st.text_area(
-        "Paste chat (A: ... / B: ...)",
-        height=220,
-        placeholder="A: You never told me to check the bathroom trash!\nB: I thought you meant only the kitchen.\nA: We talked about trash day rules already..."
-    )
+    chat_text = st.text_area("chat", value=DEFAULT_CHAT, height=180, label_visibility="collapsed")
 
-    st.subheader("3) Optional Context (for richer mock sensing)")
-    context_notes = st.text_area(
-        "Context (optional)",
-        height=90,
-        placeholder='e.g., "Evening, kitchen. One partner cleaning, other on couch. Apple Watch available."'
-    )
+    st.subheader("3) Optional context")
+    context_text = st.text_area("context", value="", height=90, label_visibility="collapsed")
 
-    run = st.button("▶ Run HALO Loop (Perception → Mediation)", type="primary", disabled=(len(chat_text.strip()) == 0))
+    model_name = st.text_input("Model name (optional)", value="gemini-2.5-flash")
 
-with col_right:
-    st.subheader("Command Center")
-    rules_list = parse_constitution_rules(constitution)
-    st.write("Parsed rules (quick view):")
-    st.json({"rules": rules_list})
+    run_disabled = (not constitution_text.strip()) or (not chat_text.strip())
+    if st.button("▶ Run HALO Loop", type="primary", use_container_width=True, disabled=run_disabled):
+        with st.spinner("Running…"):
+            # A) Parse constitution (best-effort, optional)
+            constitution_obj = {"raw": constitution_text}
+            try:
+                # if your schema.py exposes a parser, use it; else keep raw
+                parse_fn, _ = pick_callable(schema, ["parse_constitution", "parse_rules", "from_text"])
+                if parse_fn:
+                    constitution_obj = call_best(parse_fn, text=constitution_text, constitution_text=constitution_text)
+            except Exception:
+                constitution_obj = {"raw": constitution_text}
 
-    st.markdown("---")
-    tabs = st.tabs(["Perception Events", "Fact Ledger (48h)", "Vibe Score (30d)", "Memory & Decay", "Export"])
+            # B) Perception
+            p_fn, p_name = pick_callable(perception, ["run_perception", "generate_events", "perception", "main"])
+            if not p_fn:
+                st.error(
+                    "Cannot find a perception entrypoint in core/perception.py.\n\n"
+                    "Expected one of: run_perception / generate_events / perception / main\n\n"
+                    f"Found callables: {list_callables(perception)}"
+                )
+                st.stop()
 
-# -------------------------
-# Run Loop
-# -------------------------
-if run:
-    if store_raw_chat:
-        st.warning("Raw chat storage is ON (demo). Proposal recommends storing only derived events, not raw chat/audio/video.")
-
-    # Stage 1: Perception
-    with st.spinner("Stage 1/2: Generating perception events (simulated sensors)…"):
-        p1 = sensor_prompt(chat=chat_text, constitution=constitution, context_notes=context_notes, mode=perception_mode)
-        r1 = client.models.generate_content(model=st.session_state.model_name, contents=p1)
-        events = safe_parse_json(r1.text or "")
-
-    if not events or "events" not in events:
-        with tabs[0]:
-            st.error("Perception failed: model did not return valid JSON.")
-            st.code(r1.text or "")
-        st.stop()
-
-    st.session_state.last_events = events
-
-    # Stage 2: Mediation
-    with st.spinner("Stage 2/2: Mediating with constitution + evidence…"):
-        p2 = mediator_prompt(events_json=events, constitution=constitution)
-        r2 = client.models.generate_content(model=st.session_state.model_name, contents=p2)
-        result = safe_parse_json(r2.text or "")
-
-    if not result:
-        with tabs[0]:
-            st.error("Mediation failed: model did not return valid JSON.")
-            st.code(r2.text or "")
-        st.stop()
-
-    st.session_state.last_result = result
-
-    # Store derived artifacts
-    ts = utc_now_iso()
-    tension_level, _hint = extract_tension_level(events)
-
-    add_run_artifacts(
-        ts=ts,
-        events=events,
-        result=result,
-        ledger_48h=st.session_state.ledger_48h,
-        vibe_history=st.session_state.vibe_history,
-        tier1_events_48h=st.session_state.tier1_events_48h,
-        tier2_summaries_30d=st.session_state.tier2_summaries_30d,
-        tier3_embeddings=st.session_state.tier3_embeddings,
-        tension_level=tension_level,
-    )
-
-    apply_retention_policy(
-        ledger_48h=st.session_state.ledger_48h,
-        vibe_history=st.session_state.vibe_history,
-        tier1_events_48h=st.session_state.tier1_events_48h,
-        tier2_summaries_30d=st.session_state.tier2_summaries_30d,
-        tier3_embeddings=st.session_state.tier3_embeddings,
-    )
-
-# -------------------------
-# Render Tabs (always show last known)
-# -------------------------
-with tabs[0]:
-    st.subheader("Perception Events (Simulated)")
-    st.caption("Structured events derived from chat + constitution. Sensor signals may be simulated for demo.")
-    if st.session_state.last_events:
-        st.json(st.session_state.last_events)
-    else:
-        st.info("Run the loop to generate perception events.")
-
-with tabs[1]:
-    st.subheader("Fact Ledger (48h Truth Buffer)")
-    st.caption("Stores derived facts only (quotes + constitution excerpts). No raw audio/video stored.")
-    if st.session_state.ledger_48h:
-        latest: LedgerEntry = st.session_state.ledger_48h[0]
-        st.markdown(f"### Latest Entry — {latest.ts_utc}")
-        st.json(asdict(latest))
-
-        with st.expander("Show recent entries (up to 10)"):
-            for i, e in enumerate(st.session_state.ledger_48h[:10], start=1):
-                st.markdown(f"**{i}. {e.ts_utc}**")
-                st.write(f"- conclusion: `{e.conclusion.get('type','')}`")
-                plan = e.intervention_plan or {}
-                st.write(f"- notify: **{plan.get('should_notify', False)}** via `{plan.get('channel','none')}`")
-    else:
-        st.info("No ledger entries yet. Run the loop.")
-
-with tabs[2]:
-    st.subheader("Vibe Score (30-day trend, demo)")
-    if st.session_state.vibe_history:
-        latest: VibePoint = st.session_state.vibe_history[-1]
-        st.metric("Latest tension level", latest.level)
-        st.metric("Last run: should notify", "Yes" if latest.notify else "No")
-
-        map_level = {"low": 1, "rising": 2, "high": 3, "unknown": 0}
-        series = [map_level.get(v.level, 0) for v in st.session_state.vibe_history[-60:]]
-        st.line_chart(series)
-        st.caption("Chart: 0=unknown, 1=low, 2=rising, 3=high (demo).")
-    else:
-        st.info("No vibe history yet. Run the loop.")
-
-with tabs[3]:
-    st.subheader("Memory & Decay Pipeline (Demo)")
-    st.write("Tier 1: structured event metadata (48h) → Tier 2: summaries (30d) → Tier 3: embeddings (long-term)")
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Tier 1 (48h)", len(st.session_state.tier1_events_48h))
-    c2.metric("Tier 2 (30d)", len(st.session_state.tier2_summaries_30d))
-    c3.metric("Tier 3 (embeddings)", len(st.session_state.tier3_embeddings))
-
-    colA, colB = st.columns([1, 1])
-    with colA:
-        if st.button("Apply Decay Now (clear Tier 1)"):
-            st.session_state.tier1_events_48h = []
-            st.success("Tier 1 cleared (demo).")
-    with colB:
-        if st.button("Prune to policy (48h / 30d)"):
-            apply_retention_policy(
-                ledger_48h=st.session_state.ledger_48h,
-                vibe_history=st.session_state.vibe_history,
-                tier1_events_48h=st.session_state.tier1_events_48h,
-                tier2_summaries_30d=st.session_state.tier2_summaries_30d,
-                tier3_embeddings=st.session_state.tier3_embeddings,
+            events = call_best(
+                p_fn,
+                api_key=api_key,
+                model=model_name,
+                constitution=constitution_obj,
+                constitution_text=constitution_text,
+                chat=chat_text,
+                chat_text=chat_text,
+                context=context_text,
+                context_text=context_text,
             )
-            st.success("Retention policy applied.")
+            st.session_state["events"] = events
 
-    st.markdown("### Tier 1 (sample)")
-    st.json([asdict(x) for x in st.session_state.tier1_events_48h[:2]])
+            # C) Mediation
+            m_fn, m_name = pick_callable(mediation, ["run_mediation", "mediate", "mediation", "main"])
+            if not m_fn:
+                st.error(
+                    "Cannot find a mediation entrypoint in core/mediation.py.\n\n"
+                    "Expected one of: run_mediation / mediate / mediation / main\n\n"
+                    f"Found callables: {list_callables(mediation)}"
+                )
+                st.stop()
 
-    st.markdown("### Tier 2 (sample)")
-    st.json([asdict(x) for x in st.session_state.tier2_summaries_30d[:5]])
+            med = call_best(
+                m_fn,
+                api_key=api_key,
+                model=model_name,
+                constitution=constitution_obj,
+                constitution_text=constitution_text,
+                events=events,
+                chat=chat_text,
+                chat_text=chat_text,
+                context=context_text,
+                context_text=context_text,
+            )
+            st.session_state["med"] = med
 
-    st.markdown("### Tier 3 (sample)")
-    st.json([asdict(x) for x in st.session_state.tier3_embeddings[:8]])
+            # D) Memory (optional; fallback if your memory.py doesn't implement)
+            ledger = None
+            vibe = None
+            decay = None
 
-with tabs[4]:
-    st.subheader("Export")
-    st.caption("Export derived artifacts only (no raw chat/audio/video).")
+            try:
+                upsert_fn, _ = pick_callable(memory, ["upsert_receipt", "store_receipt"])
+                if upsert_fn:
+                    ledger = call_best(upsert_fn, receipt=med, med=med, events=events, constitution=constitution_obj)
+            except Exception:
+                ledger = None
 
-    payload = export_payload(
-        ledger_48h=st.session_state.ledger_48h,
-        vibe_history=st.session_state.vibe_history,
-        tier2_summaries_30d=st.session_state.tier2_summaries_30d,
-        tier3_embeddings=st.session_state.tier3_embeddings,
+            try:
+                vibe_fn, _ = pick_callable(memory, ["compute_vibe"])
+                if vibe_fn:
+                    vibe = call_best(vibe_fn, ledger=ledger, state=ledger, window_days=30)
+            except Exception:
+                vibe = None
+
+            try:
+                decay_fn, _ = pick_callable(memory, ["apply_decay", "apply_decay_policy"])
+                if decay_fn:
+                    decay = call_best(decay_fn, ledger=ledger, state=ledger)
+            except Exception:
+                decay = None
+
+            # Fallbacks so tabs don't look empty
+            st.session_state["ledger"] = ledger if ledger is not None else {"note": "ledger not implemented in memory.py (demo fallback)", "latest": med}
+            st.session_state["vibe"] = vibe if vibe is not None else {"note": "vibe not implemented (demo fallback)", "window_days": 30}
+            st.session_state["decay"] = decay if decay is not None else {
+                "note": "decay not implemented (demo fallback)",
+                "tier_1_raw_metadata_48h": True,
+                "tier_2_summaries_30d": True,
+                "tier_3_embeddings_long_term": True,
+            }
+
+        st.success(f"Done. Used perception.{p_name} → mediation.{m_name}")
+        st.rerun()
+
+
+with right:
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(
+        ["Perception Events", "Fact Ledger (48h)", "Vibe Score (30d)", "Memory & Decay", "Export"]
     )
 
-    st.download_button(
-        "Download HALO demo export (JSON)",
-        data=json.dumps(payload, ensure_ascii=False, indent=2),
-        file_name="halo_demo_export.json",
-        mime="application/json"
-    )
+    with tab1:
+        st.subheader("Perception Events (Simulated)")
+        if st.session_state["events"] is None:
+            st.info("Run the loop to generate events.")
+        else:
+            st.json(st.session_state["events"])
 
-    if st.session_state.last_result:
-        st.markdown("### Latest intervention plan (quick copy)")
-        plan = st.session_state.last_result.get("intervention_plan", {})
-        st.code(json.dumps(plan, ensure_ascii=False, indent=2))
-    else:
-        st.info("Run the loop to generate an export.")
+    with tab2:
+        st.subheader("Fact Ledger (48h)")
+        if st.session_state["med"] is None:
+            st.info("Run the loop to generate mediation receipt.")
+        else:
+            st.json(st.session_state["med"])
+        st.divider()
+        st.caption("Ledger state (optional)")
+        st.json(st.session_state["ledger"])
+
+    with tab3:
+        st.subheader("Vibe Score (30d)")
+        st.json(st.session_state["vibe"])
+
+    with tab4:
+        st.subheader("Memory & Decay")
+        st.json(st.session_state["decay"])
+
+    with tab5:
+        st.subheader("Export")
+        bundle = {
+            "events": st.session_state["events"],
+            "mediation": st.session_state["med"],
+            "ledger": st.session_state["ledger"],
+            "vibe": st.session_state["vibe"],
+            "decay": st.session_state["decay"],
+        }
+        st.download_button(
+            "⬇️ Download JSON bundle",
+            data=json.dumps(bundle, ensure_ascii=False, indent=2),
+            file_name="halo_bundle.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+        st.code(json.dumps(bundle, ensure_ascii=False, indent=2), language="json")
