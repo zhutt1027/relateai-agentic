@@ -13,7 +13,7 @@ from core import mediation, memory, schema
 # Config
 # -------------------------
 st.set_page_config(page_title="HALO (Demo)", layout="wide")
-st.title("HALO — Ambient Agent Command Center (Demo)")
+st.title("HALO — Relationship Portal v4.2 Command Center (Demo)")
 st.caption("Constitution → Perception Events → Mediation → Ledger → Vibe Trend → Memory Decay. (Not therapy.)")
 
 
@@ -187,13 +187,29 @@ with left:
                 constitution_obj = {"raw": constitution_text}
 
             # B) Perception (implemented here)
-            events = gemini_perception(
+            perception_packet = gemini_perception(
                 model=model_name,
                 chat=chat_text,
                 constitution_text=constitution_text,
                 context_text=context_text,
-            )
+                )
+            if isinstance(perception_packet, dict) and "events" in perception_packet:
+                inner = perception_packet["events"]
+                if isinstance(inner, dict) and "events" in inner:
+                    events = inner["events"]
+                    notes = inner.get("notes", {})
+                elif isinstance(inner, list):
+                    events = inner
+                    notes = {}
+                else:
+                    events = []
+                    notes = {}
+            else:
+                events = []
+                notes = {}
             st.session_state["events"] = events
+            st.session_state["perception_notes"] = notes
+
 
             # C) Mediation (use your core/mediation.py if it has an entrypoint)
             m_fn, m_name = pick_callable(mediation, ["run_mediation", "mediate", "mediation", "main"])
